@@ -23,7 +23,6 @@ __pycache__/
 *.env
 
 # server
-compute_subnet/
 
 # Logs
 logs/
