@@ -6,6 +6,7 @@ import platform
 import signal
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import psutil
@@ -306,7 +307,6 @@ def stop_all(process_names):
         except Exception as e:
             console.print(f"[red]Error during final verification: {e}[/red]")
     
-    import subprocess
     try:
         # Check for unicorn processes on port 8000
         result = subprocess.run(["lsof", "-i", ":8000", "-t"], capture_output=True, text=True)
@@ -386,7 +386,6 @@ def start_api():
         )
         
         # Wait briefly for the process to start
-        import time
         time.sleep(2)
         
         # Find the actual PID of the uvicorn process, as nohup will create a child process
