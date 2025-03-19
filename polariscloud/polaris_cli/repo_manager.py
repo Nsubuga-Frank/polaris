@@ -18,7 +18,7 @@ REPO_FOLDER_NAME = "compute_subnet"
 def get_repo_path():
     """Get the path where the repository should be."""
     project_root = get_project_root()
-    return os.path.join(project_root, "polariscloud", REPO_FOLDER_NAME)
+    return os.path.join(project_root, REPO_FOLDER_NAME)
 
 def ensure_repository_exists():
     """

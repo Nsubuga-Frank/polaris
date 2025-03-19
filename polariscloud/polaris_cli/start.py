@@ -128,21 +128,55 @@ def stop_process(pid, process_name, force=False):
     try:
         process = psutil.Process(pid)
         console.print(f"[yellow]Terminating {process_name} (PID {pid})...[/yellow]")
+        
+        # Check if this is a heartbeat process
+        is_heartbeat = False
         try:
+            cmd = " ".join(process.cmdline())
+            if 'heartbeat_service.py' in cmd:
+                is_heartbeat = True
+                console.print(f"[yellow]This is a heartbeat process. Using enhanced termination...[/yellow]")
+        except (psutil.AccessDenied, psutil.NoSuchProcess):
+            pass
+            
+        try:
+            # First try sending SIGTERM
             process.terminate()
-            try:
-                process.wait(timeout=10)
-                console.print(f"[green]{process_name} (PID {pid}) stopped successfully.[/green]")
-                return True
-            except psutil.TimeoutExpired:
-                if force:
-                    if platform.system() == 'Windows':
-                        subprocess.run(['taskkill', '/F', '/PID', str(pid)], check=True)
+            
+            # Heartbeat processes may need extra attention
+            if is_heartbeat:
+                # Wait up to 3 seconds for process to terminate
+                gone, alive = psutil.wait_procs([process], timeout=3)
+                if process in alive:
+                    console.print(f"[yellow]{process_name} (PID {pid}) did not terminate after 3 seconds, killing forcefully...[/yellow]")
+                    process.kill()
+                    gone, alive = psutil.wait_procs([process], timeout=3)
+                    if process in alive:
+                        console.print(f"[red]WARNING: {process_name} (PID {pid}) could not be killed![/red]")
+                        if platform.system() != 'Windows':
+                            # Last resort - use SIGKILL directly
+                            os.kill(pid, signal.SIGKILL)
+                            console.print(f"[yellow]Sent SIGKILL directly to process {pid}[/yellow]")
                     else:
-                        os.kill(pid, signal.SIGKILL)
-                    console.print(f"[green]{process_name} forcefully stopped.[/green]")
+                        console.print(f"[green]{process_name} (PID {pid}) forcefully killed.[/green]")
+                else:
+                    console.print(f"[green]{process_name} (PID {pid}) terminated gracefully.[/green]")
+                return True
+            else:
+                # For non-heartbeat processes, use the original logic
+                try:
+                    process.wait(timeout=10)
+                    console.print(f"[green]{process_name} (PID {pid}) stopped successfully.[/green]")
                     return True
-                return False
+                except psutil.TimeoutExpired:
+                    if force:
+                        if platform.system() == 'Windows':
+                            subprocess.run(['taskkill', '/F', '/PID', str(pid)], check=True)
+                        else:
+                            os.kill(pid, signal.SIGKILL)
+                        console.print(f"[green]{process_name} forcefully stopped.[/green]")
+                        return True
+                    return False
         except psutil.AccessDenied:
             if not is_admin():
                 console.print("[yellow]Requesting elevated privileges...[/yellow]")
@@ -154,6 +188,21 @@ def stop_process(pid, process_name, force=False):
         return True
     except Exception as e:
         logger.error(f"Failed to stop {process_name}: {e}")
+        # Last resort for heartbeat - try direct kill command
+        if process_name == 'heartbeat':
+            try:
+                console.print(f"[yellow]Attempting emergency process kill for {process_name}...[/yellow]")
+                if platform.system() == 'Windows':
+                    subprocess.run(['taskkill', '/F', '/PID', str(pid)], check=True, capture_output=True)
+                else:
+                    result = subprocess.run(['kill', '-9', str(pid)], check=False, capture_output=True)
+                    if result.returncode == 0:
+                        console.print(f"[green]Emergency kill successful for {process_name}.[/green]")
+                        return True
+                    else:
+                        console.print(f"[red]Emergency kill failed: {result.stderr.decode()}[/red]")
+            except Exception as kill_error:
+                console.print(f"[red]Failed emergency kill: {kill_error}[/red]")
         return False
 
 def stop_all(process_names):
@@ -162,11 +211,14 @@ def stop_all(process_names):
         process_names = process_names + ["unicorn"]
         console.print("[blue]Adding unicorn to processes to stop...[/blue]")
     
+    # Check for heartbeat specifically
+    heartbeat_cleanup_needed = "heartbeat" in process_names
+    
     success = True
     for name in process_names:
         pid = read_pid(name)
         if not pid:
-            console.print(f"[yellow]{name} is not running.[/yellow]")
+            console.print(f"[yellow]{name} is not running (no PID file found).[/yellow]")
             continue
         if not stop_process(pid, name, force=False):
             console.print(f"[yellow]Attempting forced shutdown of {name}...[/yellow]")
@@ -175,6 +227,84 @@ def stop_all(process_names):
                 success = False
                 continue
         remove_pid_file(name)
+    
+    # Special handling for heartbeat - try to find and kill any heartbeat process even without PID file
+    if heartbeat_cleanup_needed:
+        # Multiple approaches to ensure heartbeat is truly dead
+        try:
+            # First try pgrep to find any Python processes with heartbeat_service.py
+            console.print("[blue]Checking for any rogue heartbeat processes...[/blue]")
+            result = subprocess.run(['pgrep', '-f', 'heartbeat_service.py'], capture_output=True, text=True)
+            if result.returncode == 0 and result.stdout.strip():
+                pids = result.stdout.strip().split('\n')
+                for pid_str in pids:
+                    try:
+                        pid = int(pid_str.strip())
+                        console.print(f"[yellow]Found rogue heartbeat process: {pid}. Attempting to terminate...[/yellow]")
+                        # First try polite SIGTERM
+                        os.kill(pid, signal.SIGTERM)
+                        time.sleep(2)  # Give it 2 seconds to terminate gracefully
+                        
+                        # Check if it's still running
+                        if psutil.pid_exists(pid):
+                            console.print(f"[yellow]Process {pid} still running, using SIGKILL...[/yellow]")
+                            os.kill(pid, signal.SIGKILL)
+                            time.sleep(1)  # Give it a second to be killed
+                            
+                            # Final check
+                            if psutil.pid_exists(pid):
+                                console.print(f"[red]WARNING: Process {pid} could not be killed![/red]")
+                                success = False
+                            else:
+                                console.print(f"[green]Successfully terminated heartbeat process {pid}[/green]")
+                        else:
+                            console.print(f"[green]Successfully terminated heartbeat process {pid}[/green]")
+                    except Exception as e:
+                        console.print(f"[red]Failed to kill heartbeat process {pid_str}: {e}[/red]")
+                        success = False
+            else:
+                console.print("[green]No rogue heartbeat processes found via pgrep.[/green]")
+                
+            # As a backup, try ps + grep to find any missed processes
+            console.print("[blue]Double-checking with ps + grep...[/blue]")
+            ps_result = subprocess.run(['ps', 'aux'], capture_output=True, text=True)
+            if ps_result.returncode == 0:
+                lines = ps_result.stdout.splitlines()
+                for line in lines:
+                    if 'heartbeat_service.py' in line and 'grep' not in line:
+                        parts = line.split()
+                        if len(parts) > 1:
+                            try:
+                                pid = int(parts[1])
+                                console.print(f"[yellow]Found additional heartbeat process via ps: {pid}[/yellow]")
+                                os.kill(pid, signal.SIGKILL)
+                                console.print(f"[green]Sent SIGKILL to process {pid}[/green]")
+                            except Exception as e:
+                                console.print(f"[red]Failed to kill process: {e}[/red]")
+                                success = False
+            
+            # Final safety - use pkill as a backstop
+            console.print("[blue]Final safety check - using pkill...[/blue]")
+            pkill_result = subprocess.run(['pkill', '-9', '-f', 'heartbeat_service.py'], capture_output=True, text=True)
+            if pkill_result.returncode == 0:
+                console.print("[green]pkill cleanup successful[/green]")
+            else:
+                console.print("[yellow]pkill found no processes to kill (good)[/yellow]")
+                
+        except Exception as e:
+            console.print(f"[red]Error during heartbeat cleanup: {e}[/red]")
+            
+        # Verify no heartbeat processes remain
+        time.sleep(1)  # Brief pause to let system catch up
+        try:
+            verify_result = subprocess.run(['pgrep', '-f', 'heartbeat_service.py'], capture_output=True, text=True)
+            if verify_result.returncode == 0 and verify_result.stdout.strip():
+                console.print("[red]WARNING: Some heartbeat processes still remain after cleanup![/red]")
+                success = False
+            else:
+                console.print("[green]Verified: All heartbeat processes terminated.[/green]")
+        except Exception as e:
+            console.print(f"[red]Error during final verification: {e}[/red]")
     
     import subprocess
     try:
@@ -337,22 +467,43 @@ def start_api():
             except Exception as e:
                 console.print(f"[yellow]Failed to get process group ID for heartbeat: {e}[/yellow]")
                 logger.warning("Heartbeat service started but PID tracking failed")
-                return True  # Continue even if heartbeat PID tracking fails
+                
+                # IMPORTANT FIX: Instead of continuing silently, try a more aggressive search for any python process running heartbeat
+                console.print("[yellow]Trying alternative method to find heartbeat process...[/yellow]")
+                try:
+                    result = subprocess.run(['pgrep', '-f', 'heartbeat_service.py'], capture_output=True, text=True)
+                    if result.returncode == 0 and result.stdout.strip():
+                        heartbeat_pid = int(result.stdout.strip())
+                        console.print(f"[green]Found heartbeat process using pgrep: {heartbeat_pid}[/green]")
+                    else:
+                        console.print("[red]Could not find heartbeat process using pgrep.[/red]")
+                        # Don't return here - warn the user but continue
+                except Exception as alt_e:
+                    console.print(f"[red]Alternative method failed: {alt_e}[/red]")
+                
+                # Even if we can't track it, warn clearly
+                if not heartbeat_pid:
+                    console.print("[red]WARNING: Heartbeat service may be running but couldn't be tracked.[/red]")
+                    console.print("[red]You may need to manually kill it later with 'pkill -f heartbeat_service.py'[/red]")
         
-        logger.info(f"Heartbeat service started with nohup and PID: {heartbeat_pid}")
-        console.print("[blue]Heartbeat service started with nohup...[/blue]")
+        if heartbeat_pid:
+            logger.info(f"Heartbeat service started with nohup and PID: {heartbeat_pid}")
+            console.print("[blue]Heartbeat service started with nohup...[/blue]")
+            
+            # Create PID file for heartbeat
+            if create_pid_file('heartbeat', heartbeat_pid):
+                console.print(f"[green]Heartbeat service running on PID {heartbeat_pid}[/green]")
+                console.print(f"[blue]Heartbeat logs: {heartbeat_log}[/blue]")
+            else:
+                console.print("[yellow]Warning: Failed to create PID file for Heartbeat service.[/yellow]")
+                return True  # Continue even if PID file creation fails
+        else:
+            # If we couldn't find the PID, warn about it specifically
+            console.print("[red]WARNING: Heartbeat service may be running but couldn't be tracked![/red]")
     except Exception as e:
         console.print(f"[yellow]Warning: Failed to start Heartbeat service: {e}[/yellow]")
-        logger.error("Failed to start Heartbeat service")
-        return True  # Continue even if heartbeat fails
+        logger.error(f"Failed to start Heartbeat service: {e}")
     
-    if heartbeat_pid:
-        if create_pid_file('heartbeat', heartbeat_pid):
-            console.print(f"[green]Heartbeat service running on PID {heartbeat_pid}[/green]")
-            console.print(f"[blue]Heartbeat logs: {heartbeat_log}[/blue]")
-        else:
-            console.print("[yellow]Warning: Failed to create PID file for Heartbeat service.[/yellow]")
-
     return True
 
 def start_system():
